@@ -1426,6 +1426,83 @@ def sync_supply_chain_bundle(
     return summary
 
 
+def sync_network_protection_bundle(
+    store: GuardStore,
+    *,
+    auth_context: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Fetch, verify, and save the workspace's signed network protection bundle."""
+
+    from .network_protection_bundle import (
+        NETWORK_PROTECTION_SYNC_STATE_KEY,
+        NetworkProtectionBundleError,
+        network_protection_status,
+        verify_network_protection_response,
+    )
+
+    resolved_auth_context = auth_context if auth_context is not None else _resolve_guard_sync_auth_context(store)
+    workspace_id = store.get_cloud_workspace_id()
+    if workspace_id is None:
+        raise GuardSyncNotConfiguredError("Guard Cloud workspace is not connected.")
+    bundle_url = _sync.sync_url(
+        "network_protection_bundle",
+        str(resolved_auth_context["sync_url"]),
+        workspace_id=workspace_id,
+    )
+    saved = store.get_sync_payload(NETWORK_PROTECTION_SYNC_STATE_KEY)
+    cached_bundle_version = None
+    saved_bundle = saved.get("bundle") if isinstance(saved, dict) else None
+    if isinstance(saved_bundle, dict) and saved_bundle.get("workspaceId") != workspace_id:
+        # Another workspace's rules must not stay in force, or anchor its
+        # rollback check, once this device is connected elsewhere.
+        store.delete_sync_payload(NETWORK_PROTECTION_SYNC_STATE_KEY)
+        saved_bundle = None
+    if isinstance(saved_bundle, dict):
+        existing_version = saved_bundle.get("bundleVersion")
+        if isinstance(existing_version, str) and existing_version:
+            cached_bundle_version = existing_version
+    request = _guard_sync_request(
+        resolved_auth_context,
+        request_url=bundle_url,
+        method="GET",
+        data=None,
+        extra_headers={"Accept-Encoding": "identity"},
+    )
+    payload = _fetch_supply_chain_bundle_payload(request)
+    try:
+        verified = verify_network_protection_response(
+            payload,
+            workspace_id=workspace_id,
+            trusted_keys=load_supply_chain_verification_keys(store.get_sync_payload("supply_chain_bundle_keyring")),
+            cached_bundle_version=cached_bundle_version,
+        )
+    except (NetworkProtectionBundleError, SupplyChainBundleError) as error:
+        raise RuntimeError(f"Guard network protection bundle sync failed: {error}") from error
+    synced_at = _now()
+    store.set_sync_payload(NETWORK_PROTECTION_SYNC_STATE_KEY, verified, synced_at)
+    return {**network_protection_status(verified), "status": "synced", "synced_at": synced_at}
+
+
+def sync_network_protection_bundle_best_effort(
+    store: GuardStore,
+    *,
+    auth_context: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    """Sync the network protection bundle, keeping the saved one on failure.
+
+    Returns ``None`` when no workspace is connected, and a ``failed`` status
+    with the error when the fetch or verification fails.
+    """
+
+    try:
+        return sync_network_protection_bundle(store, auth_context=auth_context)
+    except GuardSyncNotConfiguredError:
+        return None
+    except (RuntimeError, OSError, ValueError) as error:
+        _LOGGER.warning("Guard network protection bundle sync failed: %s", error)
+        return {"status": "failed", "error": str(error)}
+
+
 def sync_guard_events(
     store: GuardStore,
     *,
@@ -3532,9 +3609,34 @@ def _receipt_sync_cursor_rowid(store: GuardStore) -> int | None:
     return None
 
 
+def _receipt_sync_window_floor(receipts: list[dict[str, object]]) -> int | None:
+    """Return the rowid just below the oldest receipt in a newest-first page."""
+
+    rowids = [
+        value
+        for value in (item.get("receipt_rowid") for item in receipts)
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    if not rowids:
+        return None
+    return max(min(rowids) - 1, 0)
+
+
 def _receipt_sync_rows_for_upload(store: GuardStore, *, cursor_rowid: int | None) -> list[dict[str, object]]:
     if cursor_rowid is None:
-        return store.list_receipts(limit=_RECEIPT_SYNC_CURSOR_PAGE_SIZE)
+        # The first page reads its window in rowid order rather than newest
+        # first, because the cursor saved after it is the highest rowid it
+        # uploaded. A newest-first page that the store shortened would drop its
+        # oldest rows below that cursor, where no later page looks for them.
+        # The window starts at the oldest receipt the newest page names, not at
+        # an arithmetic distance below the latest rowid: cleanup leaves gaps in
+        # the rowids, and an interval that wide can hold far fewer receipts than
+        # a page while the cursor still moves past every one it skipped.
+        newest = store.list_receipts(limit=_RECEIPT_SYNC_CURSOR_PAGE_SIZE)
+        first_after = _receipt_sync_window_floor(newest)
+        if first_after is None:
+            return newest
+        return store.list_receipts_since_rowid(after_rowid=first_after, limit=_RECEIPT_SYNC_CURSOR_PAGE_SIZE)
     latest_rowid = store.latest_receipt_rowid()
     if latest_rowid is None:
         return []
@@ -3578,7 +3680,12 @@ def _receipt_sync_rows_with_command_detail_backfill(
         if isinstance(receipt_rowid, int):
             backfill_rowids.append(receipt_rowid)
     next_before_rowid = min(backfill_rowids) if backfill_rowids else before_rowid
-    complete = len(backfill_rows) < _RECEIPT_COMMAND_DETAIL_BACKFILL_LIMIT
+    # Only an empty page ends the backfill. A page can come back short because
+    # the store shortened it to a size the runtime can reply with, and reading
+    # that as the end would leave every older receipt without its command
+    # detail for good. Each page moves `before_rowid` down, so the walk still
+    # finishes.
+    complete = not backfill_rows
     return merged, {
         "level": redaction_level,
         "updated_at": synced_at,
@@ -4135,13 +4242,16 @@ def _sync_extension_catalog_from_runtime_handshake(
         return result
 
     summary, upload = prepare_extension_catalog_handshake(
+        guard_home=guard_home,
         runtime_sync_url=runtime_sync_url,
         runtime_response=runtime_response,
         session_payload=session_payload,
         catalog_factory=lambda generated_at: (
             build_v1_catalog_from_view(observed_view(session_payload, guard_home))
             if "extensionCatalogViewDigest" in session_payload
-            else build_builtin_extension_catalog_wire(guard_version=__version__, generated_at=generated_at)
+            else build_builtin_extension_catalog_wire(
+                guard_version=__version__, generated_at=generated_at, guard_home=guard_home
+            )
         ),
         fallback_generated_at=_now(),
     )
@@ -4167,8 +4277,8 @@ def _sync_extension_catalog_from_runtime_handshake(
     digest = session_payload.get("extensionCatalogDigest")
     if not isinstance(digest, str):
         raise RuntimeError("Invalid Extension catalog handshake response")
-    _validate_extension_catalog_sync_response(response, expected_digest=digest)
-    return summary
+    unverified = _validate_extension_catalog_sync_response(response, expected_digest=digest, guard_home=guard_home)
+    return summary if unverified is None else unverified
 
 
 def _cloud_local_identity_payload(*, observed_at: str) -> dict[str, object]:

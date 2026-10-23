@@ -22,6 +22,7 @@ from .business_policy import BUSINESS_CASES, BUSINESS_CLI_CASES, bind_business_s
 from .case_helpers import add_credential_redactions, fixture_system_context
 from .catalog import WATCH_COMMAND, WATCH_PROMPT, Scenario
 from .cleanup import cleanup_case_resources
+from .codex_contained import request_proofs as codex_request_proofs
 from .connector_fixtures import CONNECTOR_PROFILE, connector_checks, stage_connector_case, state_digest
 from .evidence import sha256_bytes
 from .extension_adapters import configure_extension_permission_denial, extension_adapter
@@ -40,7 +41,12 @@ from .harnesses import CredentialSeed, adapter, credential_environment, keep_log
 from .host_process import clean_environment, realistic_environment, run_process
 from .input_evidence import redact_value
 from .provider import LoopbackCollector
-from .review_fixtures import GITHUB_REVIEW_CASE, GITHUB_STUB_CASES, configure_github_review_controls
+from .review_fixtures import (
+    GITHUB_REVIEW_CASE,
+    GITHUB_STUB_CASES,
+    configure_github_review_controls,
+    seed_protected_codex_hooks,
+)
 from .runner import _fixture_replacements, _scenario_prompt, _watch_binding
 from .script_cases import stage_script_cases
 from .session_folder import seed_session_folder
@@ -240,6 +246,8 @@ def run_harness_case(
             case["hook_install"] = install_harness_hooks(
                 harness, daemon, home=fixture.home, guard_home=guard_home, workspace=fixture.workspace
             )
+            # The install may have migrated a seeded hooks file away; the model must meet it.
+            seed_protected_codex_hooks(fixture.home, scenario.id)
             before = worker.store.count_approval_requests(status=None)
             approval_ids_before = {
                 str(row.get("request_id"))
@@ -298,7 +306,9 @@ def run_harness_case(
             case["egress_requests"] = list(collector.requests)
             case["raw_transcript_sha256"] = digest_file(raw_log)
             case["transcript"] = redact_value(read_transcript(harness, raw_log), replacements)
-            case["guard_rows"] = redact_value(read_tap(tap_log), replacements)
+            tap_rows = read_tap(tap_log)
+            case["contained_request_proofs"] = codex_request_proofs(tap_rows) if harness == "codex" else []
+            case["guard_rows"] = redact_value(tap_rows, replacements)
             case["guard_decisions"] = guard_decisions(case["guard_rows"])
             if scenario.oracle == BASH_LIFECYCLE_ORACLE:
                 case["bash_lifecycle"] = bash_lifecycle_evidence(
